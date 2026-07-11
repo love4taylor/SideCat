@@ -1,0 +1,16 @@
+# macOS metadata
+.DS_Store
+
+# Local Mihomo configuration and binary
+/config.yaml
+/mihomo
+
+# Smart trainer data and generated models
+/smart-trainer/smart_weight_data.csv
+/smart-trainer/Model.bin
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
