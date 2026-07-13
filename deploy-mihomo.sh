@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Debian 单网口旁路由：
+# Debian / Arch Linux 单网口旁路由：
 # mihomo + redir-host DNS + iptables TProxy + 本机透明代理 + Docker 共存 + 对称回程兜底
 # 修改本脚本前必须阅读同目录 AGENTS.md 中的包路径、不变量和验证要求。
 #
@@ -8,7 +8,7 @@
 #   sudo ./deploy-mihomo.sh install \
 #     --iface enp2s0 \
 #     --lan-cidr 172.16.0.0/16 \
-#     --debian-ip 172.16.215.83 \
+#     --router-ip 172.16.215.83 \
 #     --mihomo ./mihomo \
 #     --config ./config.yaml
 #
@@ -65,6 +65,7 @@ MODULES_FILE="/etc/modules-load.d/mihomo-tproxy.conf"
 BACKUP_DIR="/root/mihomo-backup"
 NETWORK_OPTIM_STATE_DIR="/var/lib/mihomo-deploy"
 NETWORK_OPTIM_BACKUP="${NETWORK_OPTIM_STATE_DIR}/network-optim-backup.conf"
+RT_TABLES_FILE="/etc/iproute2/rt_tables"
 
 usage() {
     cat <<EOF
@@ -77,7 +78,8 @@ usage() {
 install 选项：
   --iface IFACE          LAN 实体网卡，例如 enp2s0
   --lan-cidr CIDR        LAN 网段，例如 172.16.0.0/16
-  --debian-ip IP         Debian 固定 LAN IP，例如 172.16.215.83
+  --router-ip IP         旁路由固定 LAN IP，例如 172.16.215.83
+  --debian-ip IP         --router-ip 的兼容参数名
   --mihomo PATH          mihomo 二进制路径，默认：./mihomo
   --config PATH          mihomo config.yaml 路径，默认：./config.yaml
   --tproxy-port PORT     默认：7894
@@ -90,7 +92,7 @@ install 选项：
   sudo $0 install \\
     --iface enp2s0 \\
     --lan-cidr 172.16.0.0/16 \\
-    --debian-ip 172.16.215.83 \\
+    --router-ip 172.16.215.83 \\
     --mihomo ./mihomo \\
     --config ./config.yaml \\
     --network-optim-level balanced
@@ -481,7 +483,7 @@ detect_network() {
         )"
     fi
 
-    [[ -n "$DEBIAN_IP" ]] || die "无法自动识别 $LAN_IF 的 IPv4 地址，请手动指定 --debian-ip。"
+    [[ -n "$DEBIAN_IP" ]] || die "无法自动识别 $LAN_IF 的 IPv4 地址，请手动指定 --router-ip。"
 
     if [[ -z "$LAN_CIDR" ]]; then
         LAN_CIDR="$(
@@ -502,10 +504,10 @@ check_input() {
     [[ "$TPROXY_PORT" != "$DNS_PORT" ]] || die "TProxy 端口和 DNS 端口不能相同。"
     configure_network_optim_profile
 
-    is_ipv4 "$DEBIAN_IP" || die "无效的 Debian IPv4 地址：$DEBIAN_IP"
+    is_ipv4 "$DEBIAN_IP" || die "无效的旁路由 IPv4 地址：$DEBIAN_IP"
     is_ipv4_cidr "$LAN_CIDR" || die "无效的 LAN IPv4 CIDR：$LAN_CIDR"
     cidr_contains_ipv4 "$LAN_CIDR" "$DEBIAN_IP" \
-        || die "Debian IPv4 地址 $DEBIAN_IP 不属于 LAN 网段 $LAN_CIDR。"
+        || die "旁路由 IPv4 地址 $DEBIAN_IP 不属于 LAN 网段 $LAN_CIDR。"
 
     ip link show "$LAN_IF" >/dev/null 2>&1 || die "网卡不存在：$LAN_IF"
     ip -4 -o addr show dev "$LAN_IF" scope global \
@@ -523,7 +525,7 @@ check_input() {
     log "网络参数："
     log "  LAN 网卡       : $LAN_IF"
     log "  LAN 网段       : $LAN_CIDR"
-    log "  Debian LAN IP  : $DEBIAN_IP"
+    log "  旁路由 LAN IP  : $DEBIAN_IP"
     log "  TProxy 端口    : $TPROXY_PORT"
     log "  mihomo DNS端口 : $DNS_PORT"
     log "  TCP 优化档位   : $NETWORK_OPTIM_LEVEL"
@@ -532,20 +534,36 @@ check_input() {
 install_packages() {
     log "安装依赖包……"
 
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y \
-        ca-certificates \
-        iproute2 \
-        iptables \
-        kmod \
-        procps \
-        conntrack \
-        tcpdump
+    if command_exists apt-get; then
+        log "使用 APT 安装 Debian 依赖包。"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y \
+            ca-certificates \
+            iproute2 \
+            iptables \
+            kmod \
+            procps \
+            conntrack \
+            tcpdump
+    elif command_exists pacman; then
+        log "使用 pacman 安装 Arch Linux 依赖包。"
+        # 不在部署脚本中刷新单个软件仓库数据库或强制整机升级。
+        pacman -S --needed --noconfirm \
+            ca-certificates \
+            iproute2 \
+            iptables \
+            kmod \
+            procps-ng \
+            conntrack-tools \
+            tcpdump
+    else
+        die "不支持的包管理器：仅支持 Debian APT 和 Arch Linux pacman。"
+    fi
 
     command_exists iptables || die "iptables 安装失败。"
     command_exists ip || die "iproute2 安装失败。"
-    command_exists sysctl || die "procps/sysctl 安装失败。"
+    command_exists sysctl || die "procps/procps-ng sysctl 安装失败。"
 }
 
 install_mihomo() {
@@ -627,7 +645,7 @@ net.ipv4.conf.default.rp_filter=0
 net.ipv4.conf.${LAN_IF}.rp_filter=0
 
 # 避免 Linux 向客户端发送 ICMP Redirect，
-# 否则客户端可能绕过 Debian 直接把主路由当作网关。
+# 否则客户端可能绕过旁路由主机，直接把主路由当作网关。
 net.ipv4.conf.all.send_redirects=0
 net.ipv4.conf.default.send_redirects=0
 net.ipv4.conf.${LAN_IF}.send_redirects=0
@@ -673,14 +691,32 @@ EOF
 }
 
 write_routing_service() {
+    local candidate
+    local ip_binary
+    local rt_tables_template=""
+
     log "创建 TProxy 策略路由服务……"
 
-    mkdir -p /etc/iproute2
-    if [[ ! -f /etc/iproute2/rt_tables ]]; then
-        if [[ -f /usr/share/iproute2/rt_tables ]]; then
-            cp /usr/share/iproute2/rt_tables /etc/iproute2/rt_tables
+    ip_binary="$(command -v ip || true)"
+    [[ "$ip_binary" == /* && -x "$ip_binary" ]] \
+        || die "无法确定 ip 命令的绝对路径。"
+
+    mkdir -p "$(dirname "$RT_TABLES_FILE")"
+    if [[ ! -f "$RT_TABLES_FILE" ]]; then
+        for candidate in \
+            /usr/share/iproute2/rt_tables \
+            /usr/lib/iproute2/rt_tables
+        do
+            if [[ -f "$candidate" ]]; then
+                rt_tables_template="$candidate"
+                break
+            fi
+        done
+
+        if [[ -n "$rt_tables_template" ]]; then
+            cp "$rt_tables_template" "$RT_TABLES_FILE"
         else
-            cat > /etc/iproute2/rt_tables <<'EOT'
+            cat > "$RT_TABLES_FILE" <<'EOT'
 # reserved values
 255	local
 254	main
@@ -689,8 +725,8 @@ write_routing_service() {
 EOT
         fi
     fi
-    grep -qE "^${ROUTE_TABLE}\s+mihomo$" /etc/iproute2/rt_tables 2>/dev/null \
-        || echo "${ROUTE_TABLE} mihomo" >> /etc/iproute2/rt_tables
+    grep -qE "^${ROUTE_TABLE}[[:space:]]+mihomo([[:space:]]|$)" "$RT_TABLES_FILE" 2>/dev/null \
+        || printf '%s mihomo\n' "$ROUTE_TABLE" >> "$RT_TABLES_FILE"
 
     cat > "$ROUTING_SERVICE" <<EOF
 [Unit]
@@ -702,16 +738,16 @@ Wants=network-online.target
 Type=oneshot
 
 # 每次启动先清除同规格规则，再只添加一条，避免旧版掩码或重复规则残留。
-ExecStart=/bin/sh -c 'while /usr/sbin/ip rule del fwmark ${MARK}/${MARK_MASK} lookup ${ROUTE_TABLE} priority 100 2>/dev/null; do :; done; while /usr/sbin/ip rule del fwmark ${MARK}/${MARK} lookup ${ROUTE_TABLE} priority 100 2>/dev/null; do :; done; /usr/sbin/ip rule add fwmark ${MARK}/${MARK_MASK} lookup ${ROUTE_TABLE} priority 100'
+ExecStart=/bin/sh -c 'while ${ip_binary} rule del fwmark ${MARK}/${MARK_MASK} lookup ${ROUTE_TABLE} priority 100 2>/dev/null; do :; done; while ${ip_binary} rule del fwmark ${MARK}/${MARK} lookup ${ROUTE_TABLE} priority 100 2>/dev/null; do :; done; ${ip_binary} rule add fwmark ${MARK}/${MARK_MASK} lookup ${ROUTE_TABLE} priority 100'
 
 # replace 可重复运行：不存在则创建，存在则更新。
-ExecStart=/usr/sbin/ip route replace local 0.0.0.0/0 dev lo table ${ROUTE_TABLE}
+ExecStart=${ip_binary} route replace local 0.0.0.0/0 dev lo table ${ROUTE_TABLE}
 
 # 每次开机重新应用 Zephyr Linux 分支的 CUBIC HyStart 设置。
 ExecStart=/bin/sh -c 'if [ -w /sys/module/tcp_cubic/parameters/hystart_detect ]; then echo 2 > /sys/module/tcp_cubic/parameters/hystart_detect; fi'
 
-ExecStop=/bin/sh -c 'while /usr/sbin/ip rule del fwmark ${MARK}/${MARK_MASK} lookup ${ROUTE_TABLE} priority 100 2>/dev/null; do :; done; while /usr/sbin/ip rule del fwmark ${MARK}/${MARK} lookup ${ROUTE_TABLE} priority 100 2>/dev/null; do :; done'
-ExecStop=/usr/sbin/ip route flush table ${ROUTE_TABLE}
+ExecStop=/bin/sh -c 'while ${ip_binary} rule del fwmark ${MARK}/${MARK_MASK} lookup ${ROUTE_TABLE} priority 100 2>/dev/null; do :; done; while ${ip_binary} rule del fwmark ${MARK}/${MARK} lookup ${ROUTE_TABLE} priority 100 2>/dev/null; do :; done'
+ExecStop=${ip_binary} route flush table ${ROUTE_TABLE}
 
 RemainAfterExit=yes
 
@@ -802,7 +838,7 @@ start_rules() {
         -j MARK --set-xmark "\${MARK}/\${MARK_MASK}"
     "\$IPT" -t mangle -A MIHOMO_DIVERT -j ACCEPT
 
-    # LAN 中伪装成 Debian 地址的入站包不处理；本机经 OUTPUT 标记后
+    # LAN 中伪装成旁路由地址的入站包不处理；本机经 OUTPUT 标记后
     # 重路由到 lo 的包则继续进入 TProxy。
     "\$IPT" -t mangle -A MIHOMO_TPROXY -s "\$DEBIAN_IP" \\
         -m mark ! --mark "\${MARK}/\${MARK_MASK}" -j RETURN
@@ -900,10 +936,10 @@ start_rules() {
     # 对真正经过 Linux 转发、又未被 mihomo TProxy 接管的公网流量做 SNAT。
     #
     # 作用：
-    #   客户端 -> Debian -> 主路由 -> 公网
-    #   公网 -> 主路由 -> Debian -> 客户端
+    #   客户端 -> 旁路由 -> 主路由 -> 公网
+    #   公网 -> 主路由 -> 旁路由 -> 客户端
     #
-    # 主路由因此会把回包先交给 Debian，
+    # 主路由因此会把回包先交给旁路由，
     # 避免直接回客户端造成非对称路由。
     chain_create nat MIHOMO_POSTROUTING
     "\$IPT" -t nat -F MIHOMO_POSTROUTING
@@ -1140,8 +1176,8 @@ uninstall_all() {
     while ip rule del fwmark "${MARK}/${MARK}" lookup "$ROUTE_TABLE" priority 100 2>/dev/null; do :; done
     ip route flush table "$ROUTE_TABLE" 2>/dev/null || true
 
-    if [[ -f /etc/iproute2/rt_tables ]]; then
-        sed -i -E "/^${ROUTE_TABLE}[[:space:]]+mihomo([[:space:]]|$)/d" /etc/iproute2/rt_tables
+    if [[ -f "$RT_TABLES_FILE" ]]; then
+        sed -i -E "/^${ROUTE_TABLE}[[:space:]]+mihomo([[:space:]]|$)/d" "$RT_TABLES_FILE"
     fi
 
     rm -f "$SYSCTL_FILE"
@@ -1172,8 +1208,8 @@ parse_args() {
                 LAN_CIDR="${2:?--lan-cidr 缺少参数}"
                 shift 2
                 ;;
-            --debian-ip)
-                DEBIAN_IP="${2:?--debian-ip 缺少参数}"
+            --router-ip|--debian-ip)
+                DEBIAN_IP="${2:?--router-ip/--debian-ip 缺少参数}"
                 shift 2
                 ;;
             --mihomo)
@@ -1235,7 +1271,7 @@ main() {
             echo "下一步："
             echo "1. 主路由 DHCP 网关和 DNS 均下发为：${DEBIAN_IP}"
             echo "2. 客户端重新获取 DHCP 租约或重连 Wi-Fi。"
-            echo "3. 客户端访问网站后，在 Debian 执行："
+            echo "3. 客户端访问网站后，在旁路由执行："
             echo "   sudo ${IPTABLES_SCRIPT} status"
             ;;
         status)

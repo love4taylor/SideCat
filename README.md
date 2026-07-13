@@ -1,22 +1,22 @@
 # sidecat
 
-面向 Debian/Linux 单网口旁路由的 mihomo 部署工具，同时包含 Smart/LightGBM 模型训练辅助脚本。
+面向 Debian 与 Arch Linux 单网口旁路由的 mihomo 部署工具，同时包含 Smart/LightGBM 模型训练辅助脚本。
 
-`deploy-mihomo.sh` 使用 iptables TProxy、策略路由和 DNS REDIRECT 接管 LAN 客户端及 Debian 本机符合代理条件的公网 IPv4 TCP/UDP 流量；私网、回环、链路本地、组播和保留目标保持直连。脚本只维护自己的 `MIHOMO_*` 链，并尽量与 Docker 和现有防火墙规则共存。
+`deploy-mihomo.sh` 使用 iptables TProxy、策略路由和 DNS REDIRECT 接管 LAN 客户端及旁路由本机符合代理条件的公网 IPv4 TCP/UDP 流量；私网、回环、链路本地、组播和保留目标保持直连。脚本只维护自己的 `MIHOMO_*` 链，并尽量与 Docker 和现有防火墙规则共存。
 
 ```text
 LAN 客户端 ─┐
-            ├─> Debian 单网口旁路由 ─> TProxy / DNS REDIRECT ─> mihomo ─> Internet
-Debian 本机 ─┘                         fwmark 0xcc/0xff
+            ├─> Linux 单网口旁路由 ─> TProxy / DNS REDIRECT ─> mihomo ─> Internet
+旁路由本机 ─┘                        fwmark 0xcc/0xff
 ```
 
 > [!IMPORTANT]
-> 这是明确面向 **Debian、IPv4、单个 LAN 逻辑接口和 iptables** 的部署方案。当前不支持 IPv6、原生 nftables 规则集、多 LAN 接口或同时管理多个 mihomo 实例。
+> 这是明确面向 **Debian/Arch Linux、IPv4、单个 LAN 逻辑接口和 iptables** 的部署方案。当前不支持 IPv6、原生 nftables 规则集、多 LAN 接口或同时管理多个 mihomo 实例。
 
 ## 功能
 
 - LAN 客户端 TCP/UDP 透明代理。
-- Debian 本机 TCP/UDP 透明代理。
+- 旁路由本机 TCP/UDP 透明代理。
 - LAN 与本机传统 TCP/UDP 53 端口 DNS 重定向。
 - 精确的 `0xcc/0xff` TProxy 标记与表 `204` 策略路由。
 - mihomo 出站使用 `routing-mark: 255` 绕过透明代理，避免流量回环。
@@ -29,13 +29,18 @@ Debian 本机 ─┘                         fwmark 0xcc/0xff
 
 ## 前置条件
 
-- Debian 或兼容的 Linux 发行版，使用 systemd。
+- Debian 或 Arch Linux，使用 systemd。
 - 一个配置了固定 IPv4 地址的 LAN 接口；物理接口和 `bond0` 等逻辑接口均可。
 - root 或 `sudo` 权限。
 - 与目标机器架构匹配、可执行的 mihomo Linux 二进制。
 - 一份满足下述约束的 mihomo 配置文件。
 
-安装脚本会通过 APT 安装 `ca-certificates`、`iproute2`、`iptables`、`kmod`、`procps`、`conntrack` 和 `tcpdump`。
+安装脚本会自动选择包管理器：
+
+- Debian 使用 APT 安装 `ca-certificates`、`iproute2`、`iptables`、`kmod`、`procps`、`conntrack` 和 `tcpdump`。
+- Arch Linux 使用 pacman 安装 `ca-certificates`、`iproute2`、`iptables`、`kmod`、`procps-ng`、`conntrack-tools` 和 `tcpdump`。脚本使用 `pacman -S --needed`，不会刷新单个仓库数据库或代替管理员执行整机升级。
+
+Arch 当前的 `iptables` 包使用 nft 后端，但仍提供 iptables 兼容命令；脚本只通过该兼容接口维护 `MIHOMO_*` 链，不生成或清空原生 nftables 规则集。
 
 ## 准备文件
 
@@ -76,13 +81,13 @@ tun:
 
 ## 安装
 
-下面示例使用 `bond0`、`172.16.0.0/16` 和 Debian 地址 `172.16.215.83`：
+下面示例使用 `bond0`、`172.16.0.0/16` 和旁路由地址 `172.16.215.83`：
 
 ```bash
 sudo ./deploy-mihomo.sh install \
   --iface bond0 \
   --lan-cidr 172.16.0.0/16 \
-  --debian-ip 172.16.215.83 \
+  --router-ip 172.16.215.83 \
   --mihomo ./mihomo \
   --config ./config.yaml \
   --network-optim-level balanced
@@ -94,14 +99,15 @@ sudo ./deploy-mihomo.sh install \
 | --- | --- | --- |
 | `--iface IFACE` | LAN 接口；未提供时尝试从默认路由检测 | 自动检测 |
 | `--lan-cidr CIDR` | LAN IPv4 网段 | 自动检测 |
-| `--debian-ip IP` | Debian 在 LAN 接口上的固定 IPv4 地址 | 自动检测 |
+| `--router-ip IP` | 旁路由在 LAN 接口上的固定 IPv4 地址 | 自动检测 |
+| `--debian-ip IP` | `--router-ip` 的向后兼容参数名 | 自动检测 |
 | `--mihomo PATH` | mihomo 二进制路径 | `./mihomo` |
 | `--config PATH` | mihomo 配置路径 | `./config.yaml` |
 | `--tproxy-port PORT` | TProxy 监听端口 | `7894` |
 | `--dns-port PORT` | mihomo DNS 监听端口 | `1053` |
 | `--network-optim-level LEVEL` | `conservative`、`balanced` 或 `aggressive` | `balanced` |
 
-安装完成后，将 LAN 客户端的默认网关和 DNS 都指向 Debian 的固定 LAN 地址，然后让客户端重新获取 DHCP 租约或重连网络。
+安装完成后，将 LAN 客户端的默认网关和 DNS 都指向旁路由的固定 LAN 地址，然后让客户端重新获取 DHCP 租约或重连网络。
 
 ## 日常操作
 
@@ -127,6 +133,7 @@ sudo ./deploy-mihomo.sh uninstall
 | `/usr/local/bin/mihomo` | 已安装的 mihomo 二进制 |
 | `/etc/mihomo/config.yaml` | 已规范化的运行配置 |
 | `/usr/local/sbin/mihomo-iptables` | TProxy、DNS、转发与 SNAT 规则管理 |
+| `/etc/default/mihomo-iptables` | iptables 管理脚本的接口、地址、端口与 mark 参数 |
 | `/etc/systemd/system/mihomo.service` | mihomo 服务 |
 | `/etc/systemd/system/mihomo-routing.service` | fwmark 策略路由 |
 | `/etc/systemd/system/mihomo-iptables.service` | iptables 生命周期 |
@@ -173,7 +180,7 @@ sudo iptables -t nat -S POSTROUTING | grep MIHOMO_POSTROUTING
 fwmark 0xcc/0xff lookup 204
 ```
 
-再测试 Debian 本机出口与 DNS。`curl` 和 `dig` 分别需要 `curl` 与 `dnsutils`，它们不是安装脚本的必装依赖：
+再测试旁路由本机出口与 DNS。`curl` 和 `dig` 不是安装脚本的必装依赖；Debian 的 `dig` 由 `dnsutils` 提供，Arch Linux 的 `dig` 由 `bind` 提供：
 
 ```bash
 curl -4 https://ipinfo.io/ip
@@ -221,7 +228,7 @@ python train_flexible.py
 ```text
 .
 ├── AGENTS.md                    # AI/维护者不变量和验证契约
-├── deploy-mihomo.sh             # Debian 旁路由部署入口
+├── deploy-mihomo.sh             # Debian/Arch Linux 旁路由部署入口
 ├── smart-trainer/
 │   ├── go_parser.py             # 从 Go 源码解析严格特征顺序
 │   ├── requirements.txt         # Python 固定依赖
@@ -254,7 +261,7 @@ sudo iptables -t nat -S MIHOMO_POSTROUTING
 
 当前脚本会在启动前清理同规格旧跳转，并在停止时使用完全一致的规则删除它。
 
-### DNS 正常转发但 Debian 本机 DNS 失败
+### DNS 正常转发但旁路由本机 DNS 失败
 
 确认 nat OUTPUT 包含 `MIHOMO_DNS`，同时 mangle OUTPUT 对 TCP/UDP 53 端口直接返回。本机 DNS 应走 REDIRECT，而不是先获得 TProxy mark。
 

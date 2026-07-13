@@ -10,7 +10,7 @@
 
 - Linux TCP 优化参数移植自 Zephyr `network_optim.rs` 的 Linux 分支，固定参考提交为 `e3de103dd6d05785e5f7e93bb4ea9dcce1a636b3`。不要把 macOS 或 Windows 分支移入本脚本。
 
-- `mihomo` 是目标 Debian 使用的二进制，不要在 macOS 上假定它可以执行。
+- `mihomo` 是目标 Debian/Arch Linux 使用的二进制，不要在 macOS 上假定它可以执行。
 
 - `smart-trainer/` 与旁路由部署无关。处理 mihomo 部署任务时不要顺手修改它。
 
@@ -38,7 +38,7 @@
 
 - `/etc/mihomo/config.yaml`
 
-如果为了救援临时修改了 Debian 上的生成物，必须把同一修复同步回 `deploy-mihomo.sh`，否则下一次安装会覆盖临时修复。
+如果为了救援临时修改了目标 Linux 上的生成物，必须把同一修复同步回 `deploy-mihomo.sh`，否则下一次安装会覆盖临时修复。
 
 ## Smart Trainer Synchronization Contract
 
@@ -123,17 +123,17 @@ python3 -m py_compile \
 
 这个脚本只支持下面的明确模型：
 
-- Debian/Linux，IPv4。
+- Debian 或 Arch Linux，IPv4，使用 systemd。
 
 - 单个 LAN 逻辑接口；接口可以是物理接口，也可以是 `bond0` 一类逻辑接口。
 
-- Debian 是单网口旁路由，客户端把网关和 DNS 都指向 Debian。
+- Linux 主机是单网口旁路由，客户端把网关和 DNS 都指向该主机。
 
 - LAN 客户端 TCP/UDP 使用 iptables TPROXY。
 
 - mihomo TUN 必须禁用，不能与本脚本的 iptables TProxy、DNS REDIRECT 和策略路由同时接管流量。
 
-- Debian 本机产生的公网 TCP/UDP 也透明进入 mihomo。
+- 旁路由本机产生的公网 TCP/UDP 也透明进入 mihomo。
 
 - 传统 TCP/UDP 53 端口通过 REDIRECT 进入 mihomo DNS。
 
@@ -211,7 +211,7 @@ LAN client
 
 `MIHOMO_DIVERT` 必须在同一接口的 `MIHOMO_TPROXY` 跳转之前，避免已建立透明 TCP 连接再次执行 TPROXY。
 
-### Debian Local TCP/UDP
+### Router Local TCP/UDP
 
 ```text
 local process
@@ -256,7 +256,7 @@ mihomo 自己的 DNS/出站连接带 `0xff`；`MIHOMO_DNS` 必须先检查 `0xff
 
 ### Forwarding Fallback
 
-`MIHOMO_POSTROUTING` 只处理源自 `LAN_CIDR`、从 `LAN_IF` 发出的转发流量。它排除 Debian 自身源地址及私网/本地目标，最后才执行 MASQUERADE。不要把 MASQUERADE 无条件挂到整个 POSTROUTING。
+`MIHOMO_POSTROUTING` 只处理源自 `LAN_CIDR`、从 `LAN_IF` 发出的转发流量。它排除旁路由自身源地址及私网/本地目标，最后才执行 MASQUERADE。不要把 MASQUERADE 无条件挂到整个 POSTROUTING。
 
 ## Netfilter Ordering Invariants
 
@@ -441,6 +441,10 @@ CAP_NET_BIND_SERVICE
 
 ## Input And Environment Validation
 
+依赖安装只支持 Debian APT 和 Arch Linux pacman。APT 包名保持 `procps`、`conntrack`；Arch 包名必须使用 `procps-ng`、`conntrack-tools`。pacman 分支使用 `pacman -S --needed --noconfirm`，不要用会造成部分升级的 `pacman -Sy`，也不要擅自在部署脚本中强制整机升级。
+
+`mihomo-routing.service` 中的 `ip` 必须由安装时的 `command -v ip` 解析为绝对路径，不能写死 Debian 的 `/usr/sbin/ip` 或 Arch 的 `/usr/bin/ip`。`/etc/iproute2/rt_tables` 的创建和卸载清理必须共用 `RT_TABLES_FILE`。
+
 安装前必须拒绝：
 
 - 不存在或不可执行的 mihomo 二进制。
@@ -475,8 +479,8 @@ CAP_NET_BIND_SERVICE
 8. 对 systemd 修改检查启动顺序、停止顺序、幂等 restart 和 uninstall。
 9. 修改 Linux TCP 参数时核对三档完整矩阵、首次备份、卸载恢复、HyStart 开机重设和状态输出；不要只改 sysctl 文件。
 10. 先验证外层脚本，再实际生成临时 `mihomo-iptables` 验证内层脚本。
-11. 明确区分“源脚本已修改”和“目标 Debian 已重新部署”；不要声称本地修改已经自动同步到 home-nuc。
-12. 不要承诺绝对无 bug；如果没有在目标 Debian 加载真实规则，必须说明运行验证仍待完成。
+11. 明确区分“源脚本已修改”和“目标 Linux 已重新部署”；不要声称本地修改已经自动同步到目标机。
+12. 不要承诺绝对无 bug；如果没有在目标 Linux 加载真实规则，必须说明运行验证仍待完成。
 
 ## Required Static Verification
 
@@ -536,7 +540,7 @@ DNS_PORT=1053
 
 如果环境有 ShellCheck，运行它，但不要为了通过 ShellCheck 机械改变具有 netfilter 语义的参数顺序。
 
-## Required Debian Runtime Verification
+## Required Linux Runtime Verification
 
 重新部署后检查：
 
@@ -633,7 +637,7 @@ systemctl restart mihomo-iptables.service
 
 - 是否存在旧的重复 policy rule。
 
-### DNS works for LAN but not Debian itself
+### DNS works for LAN but not the router itself
 
 检查 nat OUTPUT 的 TCP/UDP 53 跳转，以及 MIHOMO_OUTPUT 是否在 mangle 阶段对 53 端口 RETURN。不要把本机 DNS 直接打 TProxy mark。
 
@@ -657,6 +661,6 @@ systemctl restart mihomo-iptables.service
 
 - Docker 规则为什么不会被清空或覆盖？
 
-- 哪些结论只经过静态验证，哪些已经在目标 Debian 实测？
+- 哪些结论只经过静态验证，哪些已经在目标 Linux 实测？
 
 如果无法回答，不要继续修改防火墙或策略路由代码。
