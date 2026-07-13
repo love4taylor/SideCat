@@ -24,6 +24,8 @@
 
 - `/usr/local/sbin/mihomo-iptables`
 
+- `/etc/default/mihomo-iptables`
+
 - `/etc/systemd/system/mihomo.service`
 
 - `/etc/systemd/system/mihomo-routing.service`

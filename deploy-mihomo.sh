@@ -56,6 +56,7 @@ TCP_NOTSENT_LOWAT=""
 MIHOMO_DIR="/etc/mihomo"
 MIHOMO_BIN_DST="/usr/local/bin/mihomo"
 IPTABLES_SCRIPT="/usr/local/sbin/mihomo-iptables"
+IPTABLES_DEFAULT="/etc/default/mihomo-iptables"
 ROUTING_SERVICE="/etc/systemd/system/mihomo-routing.service"
 IPTABLES_SERVICE="/etc/systemd/system/mihomo-iptables.service"
 MIHOMO_SERVICE="/etc/systemd/system/mihomo.service"
@@ -439,6 +440,7 @@ backup_current() {
         /etc/mihomo \
         /usr/local/bin/mihomo \
         /usr/local/sbin/mihomo-iptables \
+        /etc/default/mihomo-iptables \
         /etc/systemd/system/mihomo.service \
         /etc/systemd/system/mihomo-routing.service \
         /etc/systemd/system/mihomo-iptables.service \
@@ -729,17 +731,29 @@ write_iptables_script() {
 
 set -Eeuo pipefail
 
+IPTABLES_DEFAULT="${IPTABLES_DEFAULT}"
+[[ -r "\$IPTABLES_DEFAULT" ]] \\
+    || { echo "Missing configuration: \$IPTABLES_DEFAULT" >&2; exit 1; }
+
+# shellcheck disable=SC1090
+source "\$IPTABLES_DEFAULT"
+
+for required_variable in \\
+    LAN_IF \\
+    LAN_CIDR \\
+    DEBIAN_IP \\
+    TPROXY_PORT \\
+    DNS_PORT \\
+    MARK \\
+    MARK_MASK \\
+    BYPASS_MARK
+do
+    [[ -n "\${!required_variable:-}" ]] \\
+        || { echo "Missing \$required_variable in \$IPTABLES_DEFAULT" >&2; exit 1; }
+done
+unset required_variable
+
 IPT="\$(command -v iptables)"
-
-LAN_IF="${LAN_IF}"
-LAN_CIDR="${LAN_CIDR}"
-DEBIAN_IP="${DEBIAN_IP}"
-
-TPROXY_PORT="${TPROXY_PORT}"
-DNS_PORT="${DNS_PORT}"
-MARK="${MARK}"
-MARK_MASK="${MARK_MASK}"
-BYPASS_MARK="${BYPASS_MARK}"
 
 chain_create() {
     local table="\$1"
@@ -1007,6 +1021,30 @@ EOF
     bash -n "$IPTABLES_SCRIPT"
 }
 
+write_iptables_defaults() {
+    local temporary_defaults
+
+    log "创建 iptables 参数文件……"
+
+    mkdir -p "$(dirname "$IPTABLES_DEFAULT")"
+    temporary_defaults="$(mktemp)"
+
+    {
+        printf '# 由 deploy-mihomo.sh 自动生成；修改耦合参数后应重新部署。\n'
+        printf 'LAN_IF=%q\n' "$LAN_IF"
+        printf 'LAN_CIDR=%q\n' "$LAN_CIDR"
+        printf 'DEBIAN_IP=%q\n' "$DEBIAN_IP"
+        printf 'TPROXY_PORT=%q\n' "$TPROXY_PORT"
+        printf 'DNS_PORT=%q\n' "$DNS_PORT"
+        printf 'MARK=%q\n' "$MARK"
+        printf 'MARK_MASK=%q\n' "$MARK_MASK"
+        printf 'BYPASS_MARK=%q\n' "$BYPASS_MARK"
+    } > "$temporary_defaults"
+
+    install -m 0644 "$temporary_defaults" "$IPTABLES_DEFAULT"
+    rm -f "$temporary_defaults"
+}
+
 write_iptables_service() {
     log "创建 iptables systemd 服务……"
 
@@ -1114,7 +1152,8 @@ uninstall_all() {
         "$IPTABLES_SERVICE" \
         "$MIHOMO_SERVICE" \
         "$MODULES_FILE" \
-        "$IPTABLES_SCRIPT"
+        "$IPTABLES_SCRIPT" \
+        "$IPTABLES_DEFAULT"
 
     systemctl daemon-reload
 
@@ -1183,6 +1222,7 @@ main() {
             write_modules
             write_sysctl
             write_routing_service
+            write_iptables_defaults
             write_iptables_script
             write_iptables_service
             start_services
