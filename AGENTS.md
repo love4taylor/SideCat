@@ -384,9 +384,17 @@ mihomo 服务只需要以下 capabilities：
 CAP_NET_ADMIN
 CAP_NET_RAW
 CAP_NET_BIND_SERVICE
+CAP_SYS_PTRACE
+CAP_DAC_READ_SEARCH
 ```
 
-不要无理由恢复 `CAP_SYS_PTRACE`、`CAP_SYS_TIME`、`CAP_DAC_OVERRIDE`、`CAP_DAC_READ_SEARCH` 等高权限。
+`PROCESS-NAME` 在 Linux 上通过 socket UID/inode 遍历 `/proc/<pid>/fd`，再读取
+`/proc/<pid>/exe`。`CAP_SYS_PTRACE` 用于跨 UID 的 procfs ptrace 访问检查，
+`CAP_DAC_READ_SEARCH` 用于只读绕过目录搜索和文件读取权限。不要加入与此路径无关的
+`CAP_SYS_TIME` 或权限范围更大的 `CAP_DAC_OVERRIDE`。
+
+进程识别只适用于旁路由本机产生的连接；旁路由无法读取 LAN 客户端机器上的进程信息，
+因此不能用 `PROCESS-NAME` 匹配其他设备上的应用。
 
 ## Linux TCP Optimization Invariants
 

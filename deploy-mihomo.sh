@@ -614,8 +614,9 @@ Wants=network-online.target
 Type=simple
 LimitNPROC=500
 LimitNOFILE=1000000
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+# PROCESS-NAME 需要跨 UID 读取 /proc/<pid>/fd 和 /proc/<pid>/exe。
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 ExecStartPre=/usr/local/bin/mihomo -t -d /etc/mihomo
 ExecStartPre=/usr/bin/sleep 1
 ExecStart=/usr/local/bin/mihomo -d /etc/mihomo
