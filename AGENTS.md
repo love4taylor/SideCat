@@ -1,60 +1,422 @@
-# Mihomo Side Router AI Maintenance Contract
+# Repository Guidelines
 
-本文件是本目录的 AI 维护契约。修改 `deploy-mihomo.sh` 前必须完整阅读；不要只根据某一条 iptables 命令做局部推断。这个脚本同时管理 mihomo 配置、systemd、策略路由、TProxy、DNS 重定向、单网口转发、Docker 共存和卸载清理，局部改动可能破坏其他路径。
+## Purpose and Scope
 
-## Scope
+This repository deploys mihomo as a single-interface side router on Debian and
+Arch Linux. The deployment script manages mihomo configuration, systemd units,
+policy routing, iptables TProxy rules, DNS redirection, fallback forwarding,
+Docker coexistence, TCP tuning, and uninstall cleanup. Treat those components
+as one system: a local firewall edit can break a different packet path or leave
+resources behind during restart or uninstall.
 
-- 本文件重点约束 `deploy-mihomo.sh` 和它生成的系统文件。
+These guidelines apply primarily to `deploy-mihomo.sh` and the files it
+generates. The `smart-trainer/` directory has a separate cross-language data
+contract described below.
 
-- `config.yaml` 是部署输入；脚本复制它并在安装副本中强制关闭 TUN、规范化 `routing-mark`。
+## Documentation Boundaries
 
-- Linux TCP 优化参数移植自 Zephyr `network_optim.rs` 的 Linux 分支，固定参考提交为 `e3de103dd6d05785e5f7e93bb4ea9dcce1a636b3`。不要把 macOS 或 Windows 分支移入本脚本。
+- `README.md` is user-facing. Keep it focused on prerequisites, configuration,
+  installation, operation, verification, and troubleshooting.
+- `AGENTS.md` is maintainer-facing. Keep repository policy, generated-file
+  ownership, implementation invariants, synchronization baselines, and release
+  checks here.
+- Do not put Git hygiene, contributor instructions, upstream synchronization
+  details, or automation-specific language in `README.md`.
+- Keep documentation claims synchronized with the current source. Distinguish
+  static source validation from tests performed on a target Linux host.
 
-- `mihomo` 是目标 Debian/Arch Linux 使用的二进制，不要在 macOS 上假定它可以执行。
+## Repository Layout
 
-- `smart-trainer/` 与旁路由部署无关。处理 mihomo 部署任务时不要顺手修改它。
+- `deploy-mihomo.sh`: source of truth for deployment and generated system
+  files.
+- `config.yaml`: deployment input. The installed copy is normalized before
+  mihomo starts.
+- `mihomo`: target-host Linux binary. Do not assume it can run on macOS.
+- `smart-trainer/`: optional Go/Python Smart/LightGBM model tooling, independent
+  of side-router deployment.
 
-- 只有用户明确要求训练器或上游 Smart/LightGBM 同步时才修改 `smart-trainer/`；其 Go/Python 文件共享一个严格的数据契约，不能只更新其中一个。
+Do not modify `smart-trainer/` while working on deployment unless the requested
+change explicitly covers the trainer or an upstream Smart synchronization.
+Likewise, do not alter deployment behavior while performing trainer-only work.
 
-- 除非用户明确要求，不要提交 Git、重写历史、删除用户配置或改动代理策略内容。
+Do not create commits, rewrite history, delete user configuration, or change
+proxy policy content unless the task explicitly requests that action.
 
-## Source Of Truth
+## Generated Deployment Artifacts
 
-`deploy-mihomo.sh` 是唯一长期维护的部署源。以下文件均由它生成，不能只修改生成物而不回写生成器：
+`deploy-mihomo.sh` is the only durable source for these generated files:
 
 - `/usr/local/sbin/mihomo-iptables`
-
 - `/etc/default/mihomo-iptables`
-
 - `/etc/systemd/system/mihomo.service`
-
 - `/etc/systemd/system/mihomo-routing.service`
-
 - `/etc/systemd/system/mihomo-iptables.service`
-
 - `/etc/sysctl.d/99-mihomo.conf`
-
 - `/etc/modules-load.d/mihomo-tproxy.conf`
-
 - `/etc/mihomo/config.yaml`
 
-如果为了救援临时修改了目标 Linux 上的生成物，必须把同一修复同步回 `deploy-mihomo.sh`，否则下一次安装会覆盖临时修复。
+Never fix only a generated file. A target-host emergency change must be copied
+back into the corresponding generator in `deploy-mihomo.sh`, or the next
+installation will overwrite it.
 
-## Smart Trainer Synchronization Contract
+## Supported Deployment Model
 
-`smart-trainer/transform.go` 跟随 `vernesong/mihomo` 的 `Alpha` 分支：
+The supported topology is deliberately narrow:
+
+- Debian or Arch Linux with systemd and IPv4.
+- One logical LAN interface, either a physical device or a device such as
+  `bond0`.
+- A single-interface side router whose clients use it as both gateway and DNS
+  server.
+- LAN TCP/UDP interception through the iptables-compatible TProxy interface.
+- Router-local public TCP/UDP interception through OUTPUT marking and loopback
+  PREROUTING.
+- Traditional TCP/UDP port 53 redirection to mihomo DNS.
+- Direct handling for private, loopback, link-local, multicast, and reserved
+  destinations.
+- Restricted MASQUERADE for public forwarding traffic not consumed by TProxy.
+- Coexistence with Docker without flushing Docker or system rules.
+- One mihomo instance and one policy-routing domain.
+
+TUN must remain disabled because it conflicts with this script's TProxy, DNS
+REDIRECT, and policy-routing ownership.
+
+Unsupported without a redesign and target-host testing: IPv6, native nftables
+rulesets, multiple LAN interfaces, multiple independent routing domains, or
+multiple mihomo instances. Arch's nft-backed `iptables` compatibility frontend
+is supported; a separately managed native nftables ruleset is not.
+
+## Deployment Invariants
+
+### Coupled Values
+
+The following defaults form one contract and must be audited together:
 
 ```text
-component/smart/lightgbm/transform.go
+TPROXY_PORT=7894
+DNS_PORT=1053
+MARK=0xcc
+MARK_MASK=0xff
+BYPASS_MARK=0xff
+BYPASS_MARK_DEC=255
+ROUTE_TABLE=204
+policy rule priority=100
+NETWORK_OPTIM_LEVEL=balanced
+NETWORK_OPTIM_BACKUP=/var/lib/mihomo-deploy/network-optim-backup.conf
 ```
 
-当前同步基线提交为 `4e0e8d846e2f03d4238433d3b2ed3e24901693b4`。同步上游时必须同时审计并更新：
+The installed configuration must contain one top-level `routing-mark: 255`.
+The policy rule must be `fwmark 0xcc/0xff lookup 204 priority 100`, and table
+204 must contain `local 0.0.0.0/0 dev lo`.
+
+Never change the policy mask back to `0xcc/0xcc`. That mask tests only the set
+bits in `0xcc`, so the mihomo bypass mark `0xff` also matches it and is routed
+back to the local table, creating an outbound loop. `/0xff` is the required
+exact match.
+
+Any mark change requires a coordinated audit of:
+
+- the installed `routing-mark`;
+- bypass rules in `MIHOMO_OUTPUT` and `MIHOMO_DNS`;
+- every `MARK --set-xmark` and `TPROXY --tproxy-mark` rule;
+- policy-rule start, stop, migration, and uninstall logic.
+
+### Packet Paths
+
+LAN client TCP/UDP:
+
+```text
+LAN client
+  -> mangle PREROUTING on LAN_IF
+  -> MIHOMO_DIVERT for an existing transparent TCP socket, or
+  -> MIHOMO_TPROXY
+  -> TPROXY to 127.0.0.1:TPROXY_PORT and set 0xcc/0xff
+  -> policy rule table 204
+  -> local route on lo
+  -> mihomo tproxy listener
+```
+
+`MIHOMO_DIVERT` must precede `MIHOMO_TPROXY` on the same interface so an
+established transparent TCP socket is not TProxied again.
+
+Router-local TCP/UDP:
+
+```text
+local process
+  -> mangle OUTPUT
+  -> MIHOMO_OUTPUT
+  -> bypass 0xff and excluded destinations return
+  -> public TCP/UDP gets mark 0xcc/0xff
+  -> policy rule table 204
+  -> local route on lo
+  -> mangle PREROUTING on lo
+  -> MIHOMO_DIVERT or MIHOMO_TPROXY
+  -> mihomo
+```
+
+OUTPUT marking alone is insufficient. Keep both loopback PREROUTING jumps or
+the rerouted packet never reaches TProxy. The `DEBIAN_IP` source exclusion in
+`MIHOMO_TPROXY` must allow router-local packets that already carry
+`MARK/MARK_MASK`; an unconditional `-s "$DEBIAN_IP" -j RETURN` breaks local
+transparent proxying.
+
+LAN DNS:
+
+```text
+LAN client :53
+  -> mangle PREROUTING excludes DNS from TProxy
+  -> nat PREROUTING
+  -> MIHOMO_DNS
+  -> REDIRECT to DNS_PORT
+```
+
+Router-local DNS:
+
+```text
+local process :53
+  -> MIHOMO_OUTPUT returns without a TProxy mark
+  -> nat OUTPUT
+  -> MIHOMO_DNS
+  -> REDIRECT to DNS_PORT
+```
+
+Mihomo's own DNS and outbound sockets carry `0xff`. `MIHOMO_DNS` must return
+on `0xff/0xff` before REDIRECT, or DNS loops back into mihomo.
+
+Forwarding fallback is intentionally narrow. `MIHOMO_POSTROUTING` handles only
+traffic sourced from `LAN_CIDR` and emitted through `LAN_IF`; it excludes the
+router address and private/local destinations before MASQUERADE. Never attach
+an unconditional MASQUERADE rule to all of POSTROUTING.
+
+### Netfilter Ownership and Ordering
+
+The generated helper owns only these chains:
+
+- `mangle/MIHOMO_DIVERT`
+- `mangle/MIHOMO_TPROXY`
+- `mangle/MIHOMO_OUTPUT`
+- `nat/MIHOMO_DNS`
+- `nat/MIHOMO_POSTROUTING`
+- `filter/MIHOMO_FORWARD`
+
+It may flush or remove only its own `MIHOMO_*` chains and the exact parent jumps
+it created. Never use any of the following approaches:
+
+```text
+iptables -F
+iptables -X
+iptables-restore with a full replacement ruleset
+nft flush ruleset
+flushing DOCKER-USER
+changing the FORWARD policy to ACCEPT
+```
+
+The final PREROUTING order on each relevant interface must be:
+
+```text
+MIHOMO_DIVERT
+MIHOMO_TPROXY
+```
+
+DNS jumps in nat PREROUTING and OUTPUT must be early enough to precede generic
+DNS NAT rules. Mangle OUTPUT currently appends `MIHOMO_OUTPUT` to respect
+existing marks. Moving it to position 1 requires an explicit conflict analysis
+for other fwmarks, VPNs, Docker, and policy routing.
+
+### Start/Stop Symmetry
+
+Every parent-chain jump requires three byte-for-byte equivalent rule
+specifications:
+
+1. `delete_all` before insertion in `start_rules`.
+2. The `iptables -I` or `iptables -A` operation in `start_rules`.
+3. The matching `delete_all` operation in `stop_rules`.
+
+`iptables -C` and `iptables -D` compare the full rule. An extra source negation,
+a different mask, interface, or module order can prevent cleanup.
+
+The POSTROUTING rule must be identical in all three locations:
+
+```text
+-o LAN_IF -s LAN_CIDR -j MIHOMO_POSTROUTING
+```
+
+Do not reintroduce the historical stop-only `! -s DEBIAN_IP` condition. It left
+the parent jump in place, prevented removal of the referenced custom chain, and
+produced an empty residual chain. `chain_remove` must expose reference/removal
+errors rather than falsely reporting success.
+
+When adding, removing, or changing a parent jump, update all three copies and
+compare their rendered arguments character by character. This symmetry makes
+restarts idempotent and prevents empty chains after stop or uninstall.
+
+### Policy Routing
+
+`mihomo-routing.service` owns:
+
+- `fwmark 0xcc/0xff lookup 204 priority 100`;
+- the obsolete `fwmark 0xcc/0xcc lookup 204 priority 100` rule during migration
+  cleanup;
+- the local default route in table 204.
+
+Startup must loop-delete every duplicate of both old and current rule forms,
+then add exactly one current rule. Stop must remove every old/current rule and
+flush table 204. `mihomo-iptables.service` must require and start after
+`mihomo-routing.service`; TProxy rules must not remain active without their
+policy route.
+
+Uninstall must remove all duplicate policy rules, table 204 state, the script's
+`204 mihomo` entry in `/etc/iproute2/rt_tables`, every owned parent jump and
+chain, all three systemd units, and the owned sysctl/modules-load files. By
+design it preserves `/etc/mihomo/config.yaml` and `/usr/local/bin/mihomo` unless
+their removal is explicitly requested.
+
+### Mihomo Configuration
+
+Before starting the service, installation must verify all of the following:
+
+- If a top-level block-style `tun:` exists, its direct `enable` child is
+  normalized to exactly one `false`; a missing direct child is added. If no
+  `tun:` block exists, mihomo's disabled default is retained.
+- Duplicate top-level `tun:` blocks and inline `tun: { ... }` mappings are
+  rejected instead of modified.
+- Normalization never changes unrelated `enable` keys under DNS, NTP, sniffer,
+  health checks, or other sections.
+- Top-level `tproxy-port` matches `TPROXY_PORT`.
+- DNS `enhanced-mode` is `redir-host`, and the DNS listen port matches
+  `DNS_PORT`.
+- Exactly one top-level `routing-mark: 255` is present.
+- `/usr/local/bin/mihomo -t -d /etc/mihomo` succeeds.
+
+The mihomo unit must repeat the configuration check in `ExecStartPre` so a
+later manual configuration error cannot start unnoticed.
+
+### Systemd Capabilities and PROCESS-NAME
+
+The mihomo service capability set is limited to:
+
+```text
+CAP_NET_ADMIN
+CAP_NET_RAW
+CAP_NET_BIND_SERVICE
+CAP_SYS_PTRACE
+CAP_DAC_READ_SEARCH
+```
+
+On Linux, `PROCESS-NAME` resolves a socket UID/inode through
+`/proc/<pid>/fd`, then reads `/proc/<pid>/exe`. `CAP_SYS_PTRACE` permits the
+cross-UID procfs ptrace access check, while `CAP_DAC_READ_SEARCH` provides the
+read-only directory-search and file-read bypass needed for that lookup. Do not
+add unrelated `CAP_SYS_TIME` or the broader `CAP_DAC_OVERRIDE`.
+
+Process identification applies only to connections created on the side router.
+The router cannot inspect processes on a LAN client, so `PROCESS-NAME` cannot
+match applications running on another computer, phone, or console.
+
+### Linux TCP Optimization
+
+The Linux tuning is based only on Zephyr's Linux `network_optim.rs` behavior at
+commit `e3de103dd6d05785e5f7e93bb4ea9dcce1a636b3`:
+
+- `net.ipv4.tcp_fastopen`
+- `net.ipv4.tcp_ecn`
+- `net.core.rmem_max`
+- `net.core.wmem_max`
+- `net.ipv4.tcp_rmem`
+- `net.ipv4.tcp_wmem`
+- `net.ipv4.tcp_notsent_lowat`
+- `/sys/module/tcp_cubic/parameters/hystart_detect=2`
+
+Do not add BBR, `default_qdisc`, or `tcp_congestion_control` under the label of
+completing this port. Tuning CUBIC HyStart does not select CUBIC as the system
+congestion-control algorithm.
+
+Keep the profiles exactly as follows:
+
+| Parameter | conservative | balanced | aggressive |
+| --- | ---: | ---: | ---: |
+| `tcp_fastopen` | 1 | 3 | 3 |
+| `tcp_ecn` | 2 | 1 | 1 |
+| `rmem_max` | 8388608 | 16777216 | 33554432 |
+| `wmem_max` | 16777216 | 33554432 | 67108864 |
+| `tcp_rmem` | `4096 131072 8388608` | `4096 262144 16777216` | `4096 524288 33554432` |
+| `tcp_wmem` | `4096 131072 16777216` | `4096 262144 33554432` | `4096 524288 67108864` |
+| `tcp_notsent_lowat` | 65536 | 131072 | 262144 |
+
+Lifecycle requirements:
+
+1. `write_modules` loads `tcp_cubic` before `write_sysctl` backs up and applies
+   values.
+2. `/var/lib/mihomo-deploy/network-optim-backup.conf` is created only when it
+   does not exist. Reinstallation must not replace the original pre-install
+   values.
+3. The backup may contain only the seven sysctl keys above and
+   `sys.module.tcp_cubic.hystart_detect`. Restore must enforce an exact key
+   allowlist and numeric/whitespace-only values to prevent command injection.
+4. Persistent sysctl values belong in `/etc/sysctl.d/99-mihomo.conf`. Do not
+   introduce a second tuning file such as `99-zephyr-tcp-tuning.conf`.
+5. `mihomo-routing.service` reapplies `hystart_detect=2` at every start because
+   sysctl does not persist a sysfs module parameter.
+6. Uninstall removes `99-mihomo.conf` before restoring runtime values. It
+   deletes the backup only after every restore succeeds; any failure preserves
+   the backup and reports an error.
+7. `status` reports all seven sysctl values and the live HyStart value rather
+   than inferring success from a file's presence.
+
+The default remains `balanced`, matching upstream `OptimLevel::Balanced`.
+Changing it is a behavior change and requires an explicit request. The CLI
+accepts only `conservative`, `balanced`, and `aggressive`.
+
+### Docker Coexistence
+
+- If `DOCKER-USER` exists, insert the `MIHOMO_FORWARD` jump there.
+- Fall back to `FORWARD` only when `DOCKER-USER` does not exist.
+- `stop_rules` must try to remove the jump from both locations because Docker
+  may start or stop after deployment.
+- Never remove, reorder, flush, or recreate Docker-owned chains.
+
+### Input and Package Validation
+
+Dependency installation supports Debian APT and Arch Linux pacman only. Keep
+APT package names `procps` and `conntrack`; keep Arch package names `procps-ng`
+and `conntrack-tools`. Use `pacman -S --needed --noconfirm`, never `pacman -Sy`,
+and do not force a full system upgrade from the deployment script.
+
+Resolve the `ip` executable with `command -v ip` during installation and place
+the absolute path in `mihomo-routing.service`; do not hard-code either Debian's
+`/usr/sbin/ip` or Arch's `/usr/bin/ip`. Creation and uninstall cleanup of
+`/etc/iproute2/rt_tables` must share `RT_TABLES_FILE`.
+
+Installation must reject:
+
+- a missing or non-executable mihomo binary;
+- a missing configuration file;
+- zero, non-numeric, or greater-than-65535 ports;
+- identical TProxy and DNS ports;
+- invalid IPv4 addresses or CIDRs;
+- a `DEBIAN_IP` outside `LAN_CIDR`;
+- a nonexistent `LAN_IF`;
+- a `DEBIAN_IP` not actually assigned to `LAN_IF`.
+
+The script uses `set -Eeuo pipefail`. Avoid probe pipelines whose downstream
+command exits early and gives the producer SIGPIPE, such as
+`awk '... { print; exit }'`; consume the full input or handle pipeline status
+explicitly.
+
+## Smart Trainer Contract
+
+`smart-trainer/transform.go` tracks
+`component/smart/lightgbm/transform.go` from the `Alpha` branch of
+`vernesong/mihomo`. The synchronization baseline is commit
+`4e0e8d846e2f03d4238433d3b2ed3e24901693b4`.
+
+An upstream synchronization must audit and update together:
 
 - `smart-trainer/transform.go`
 - `smart-trainer/go_parser.py`
 - `smart-trainer/train_flexible.py`
 
-当前特征契约固定为连续索引 `0..29`：
+The feature order is exactly the continuous range `0..29`:
 
 ```text
 0  success
@@ -89,26 +451,37 @@ component/smart/lightgbm/transform.go
 29 geoip_hash
 ```
 
-变换契约：
+Transformation contract:
 
-- `StandardScaler`：索引 `2,3,4,5,6,7,8,9,10,11,12,13,23,24`。
-- `RobustScaler`：索引 `0,1`。
-- 其他 14 个特征必须列入 `untransformed_features`。
-- 模型尾部协议仍为 `[transforms]`、`[order]`、`[definitions]` 和 `[/transforms]`。
-- Go 端只读取模型最后 16384 字节，Python 生成的完整 transforms block 必须小于该窗口。
+- `StandardScaler`: indices `2..13,23,24`.
+- `RobustScaler`: indices `0,1`.
+- The remaining 14 features appear in `untransformed_features`.
+- The model tail remains `[transforms]`, `[order]`, `[definitions]`, and
+  `[/transforms]`.
+- Go reads only the final 16384 bytes of the model. The complete generated
+  transforms block must fit within that window.
 
-同步规则：
+Synchronization rules:
 
-1. `transform.go` 应与固定上游文件经 `gofmt` 后逐字一致，不在本地版本中加入只服务训练脚本的私有改动。
-2. `expectedCount` 必须使用 `MaxFeatureSize`，不能重新硬编码 `21` 或 `30`。
-3. `ApplyTransforms` 必须先复制输出，再把工作切片放回 `sync.Pool`；先 Put 后 copy 会产生并发数据竞态。
-4. 保留上游 `IsCompatibleWith`，由调用方检查模型内的 feature order 是否与运行时默认顺序一致。
-5. `go_parser.py` 必须失败关闭：解析结果必须恰好为连续索引 `0..29` 且名称唯一，禁止静默回退到旧的硬编码 21 特征顺序。
-6. `train_flexible.py` 必须从 Go 文件解析顺序，检查 CSV 包含全部 30 个特征和 `weight`，并按同一顺序训练和写入 metadata。
-7. Python 中的 scaler 特征名称、Go 注释中的 scaler 索引和模型尾部 `*_features` 必须三方一致。
-8. 除非用户明确要求，不修改模型目标、LightGBM 超参数、GPU/CPU 策略或 CSV 采集口径。
+1. After `gofmt`, `transform.go` must match the pinned upstream file byte for
+   byte. Do not add trainer-only private changes to the local Go copy.
+2. `expectedCount` uses `MaxFeatureSize`; do not hard-code 21 or 30 again.
+3. `ApplyTransforms` copies the output before returning working storage to
+   `sync.Pool`. Returning it first creates a concurrent data race.
+4. Preserve upstream `IsCompatibleWith` so callers can compare model feature
+   order with the runtime default.
+5. `go_parser.py` fails closed unless it parses exactly 30 unique names at
+   continuous indices `0..29`. It must not fall back to an old 21-feature
+   order.
+6. `train_flexible.py` derives order from the Go file, requires all 30 CSV
+   feature columns plus `weight`, and uses the same order for training and
+   metadata.
+7. Python scaler names, Go scaler-index comments, and model-tail
+   `*_features` remain identical.
+8. Do not change the model target, LightGBM hyperparameters, GPU/CPU policy, or
+   CSV collection schema unless explicitly requested.
 
-每次同步至少验证：
+For every synchronization, run:
 
 ```bash
 gofmt -w smart-trainer/transform.go
@@ -117,394 +490,55 @@ python3 -m py_compile \
   smart-trainer/train_flexible.py
 ```
 
-还必须执行跨语言契约测试：解析 Go 默认顺序得到 30 个连续唯一特征；StandardScaler 索引等于 `2..13,23,24`；RobustScaler 索引等于 `0,1`；生成 metadata 后重新解析 `[order]` 和 definitions，确认参数数量与索引数量一致。若环境没有完整 mihomo Go 模块，不能声称 `transform.go` 已独立编译，只能报告 `gofmt`、上游逐字比较和 Python 契约测试结果。
-
-## Supported Topology
-
-这个脚本只支持下面的明确模型：
-
-- Debian 或 Arch Linux，IPv4，使用 systemd。
-
-- 单个 LAN 逻辑接口；接口可以是物理接口，也可以是 `bond0` 一类逻辑接口。
-
-- Linux 主机是单网口旁路由，客户端把网关和 DNS 都指向该主机。
-
-- LAN 客户端 TCP/UDP 使用 iptables TPROXY。
-
-- mihomo TUN 必须禁用，不能与本脚本的 iptables TProxy、DNS REDIRECT 和策略路由同时接管流量。
-
-- 旁路由本机产生的公网 TCP/UDP 也透明进入 mihomo。
-
-- 传统 TCP/UDP 53 端口通过 REDIRECT 进入 mihomo DNS。
-
-- 私网、回环、链路本地、组播和保留目标保持直连。
-
-- 未被 TPROXY 接管、仍需正常转发的公网流量使用 MASQUERADE 保证对称回程。
-
-- 与 Docker 规则共存，不清空 Docker 或系统规则。
-
-- Linux TCP 优化提供 `conservative`、`balanced`、`aggressive` 三档，默认 `balanced`，并保存首次安装前的内核值供卸载恢复。
-
-当前不支持：IPv6、原生 nftables 规则集、多 LAN 接口、多独立策略路由域、同时管理多个 mihomo 实例。不要在没有重新设计和目标机实测的情况下声称支持这些场景。
-
-## Coupled Constants
-
-以下值彼此耦合，不得只改一处：
-
-```text
-TPROXY_PORT=7894
-DNS_PORT=1053
-MARK=0xcc
-MARK_MASK=0xff
-BYPASS_MARK=0xff
-BYPASS_MARK_DEC=255
-ROUTE_TABLE=204
-policy rule priority=100
-NETWORK_OPTIM_LEVEL=balanced
-NETWORK_OPTIM_BACKUP=/var/lib/mihomo-deploy/network-optim-backup.conf
-```
-
-含义：
-
-- `MARK/MARK_MASK` 即 `0xcc/0xff`，是需要送入 TProxy 的精确 fwmark。
-
-- `BYPASS_MARK` 即 `0xff`，是 mihomo 自身出站 socket 的绕行标记。
-
-- 安装后的 `/etc/mihomo/config.yaml` 必须包含唯一的顶层 `routing-mark: 255`。
-
-- 路由规则必须是 `fwmark 0xcc/0xff lookup 204 priority 100`。
-
-- 表 204 必须包含 `local 0.0.0.0/0 dev lo`。
-
-绝对不要把策略规则恢复成 `0xcc/0xcc`。掩码 `0xcc` 只检查对应的置位位，而 `0xff` 同样包含这些位，因此 mihomo 的绕行标记 `0xff` 也会错误匹配该规则，造成自身出站被送回本机路由表并产生回环。必须使用完整掩码 `/0xff` 做精确匹配。
-
-如果更换任一 mark，必须同时审计：
-
-- `routing-mark`
-
-- `MIHOMO_OUTPUT` 的绕行规则
-
-- `MIHOMO_DNS` 的绕行规则
-
-- `MARK --set-xmark`
-
-- `TPROXY --tproxy-mark`
-
-- `ip rule` 的启动、停止和卸载逻辑
-
-- 旧规则迁移与清理逻辑
-
-## Packet Paths
-
-### LAN Client TCP/UDP
-
-```text
-LAN client
-  -> mangle PREROUTING on LAN_IF
-  -> MIHOMO_DIVERT for an existing transparent TCP socket, or
-  -> MIHOMO_TPROXY
-  -> TPROXY to 127.0.0.1:TPROXY_PORT and set 0xcc/0xff
-  -> policy rule table 204
-  -> local route on lo
-  -> mihomo tproxy listener
-```
-
-`MIHOMO_DIVERT` 必须在同一接口的 `MIHOMO_TPROXY` 跳转之前，避免已建立透明 TCP 连接再次执行 TPROXY。
-
-### Router Local TCP/UDP
-
-```text
-local process
-  -> mangle OUTPUT
-  -> MIHOMO_OUTPUT
-  -> bypass 0xff and excluded destinations return
-  -> public TCP/UDP gets mark 0xcc/0xff
-  -> policy rule table 204
-  -> local route on lo
-  -> mangle PREROUTING on lo
-  -> MIHOMO_DIVERT or MIHOMO_TPROXY
-  -> mihomo
-```
-
-仅在 OUTPUT 打 mark 不够。必须同时保留 `lo` 上的 PREROUTING 跳转，否则本机流量虽然被策略路由到回环接口，却不会进入 TPROXY。
-
-`MIHOMO_TPROXY` 中针对 `DEBIAN_IP` 的源地址排除必须允许已经带 `MARK/MARK_MASK` 的本机重路由包通过。不要恢复为无条件 `-s "$DEBIAN_IP" -j RETURN`，否则本机透明代理会全部失效。
-
-### DNS
-
-LAN DNS：
-
-```text
-LAN client :53
-  -> mangle PREROUTING does not TPROXY DNS
-  -> nat PREROUTING
-  -> MIHOMO_DNS
-  -> REDIRECT to DNS_PORT
-```
-
-本机 DNS：
-
-```text
-local process :53
-  -> MIHOMO_OUTPUT returns without TProxy mark
-  -> nat OUTPUT
-  -> MIHOMO_DNS
-  -> REDIRECT to DNS_PORT
-```
-
-mihomo 自己的 DNS/出站连接带 `0xff`；`MIHOMO_DNS` 必须先检查 `0xff/0xff` 并返回，否则会发生 DNS 回环。
-
-### Forwarding Fallback
-
-`MIHOMO_POSTROUTING` 只处理源自 `LAN_CIDR`、从 `LAN_IF` 发出的转发流量。它排除旁路由自身源地址及私网/本地目标，最后才执行 MASQUERADE。不要把 MASQUERADE 无条件挂到整个 POSTROUTING。
-
-## Netfilter Ordering Invariants
-
-生成脚本只拥有以下自定义链：
-
-- `mangle/MIHOMO_DIVERT`
-
-- `mangle/MIHOMO_TPROXY`
-
-- `mangle/MIHOMO_OUTPUT`
-
-- `nat/MIHOMO_DNS`
-
-- `nat/MIHOMO_POSTROUTING`
-
-- `filter/MIHOMO_FORWARD`
-
-禁止使用以下破坏性操作：
-
-```text
-iptables -F
-iptables -X
-iptables-restore with a full replacement ruleset
-nft flush ruleset
-清空 DOCKER-USER
-把 FORWARD policy 改成 ACCEPT
-```
-
-脚本只能清空或删除自己命名为 `MIHOMO_*` 的链，并只能删除自己精确创建的父链跳转。
-
-同一接口的 PREROUTING 最终顺序必须是：
-
-```text
-MIHOMO_DIVERT
-MIHOMO_TPROXY
-```
-
-DNS 的 nat PREROUTING/OUTPUT 跳转要足够靠前，以免先被其他通用 DNS NAT 规则截获。mangle OUTPUT 当前尊重已有规则并将 `MIHOMO_OUTPUT` 追加到 OUTPUT；如果要改成插入第 1 条，必须先评估与其他本机 fwmark、VPN、Docker 和策略路由的冲突。
-
-## Start/Stop Symmetry
-
-这是最容易被 AI 局部修改后破坏的约束。
-
-每个父链跳转必须有三份完全一致的参数：
-
-1. `start_rules` 插入前的 `delete_all`。
-2. `start_rules` 的 `iptables -I` 或 `iptables -A`。
-3. `stop_rules` 的 `delete_all`。
-
-iptables 的 `-C` 和 `-D` 按完整规则规格匹配。哪怕只多一个 `! -s`、不同的 mask、不同的接口或不同的模块顺序，也可能无法删除。
-
-历史 bug：POSTROUTING 启动时创建的是：
-
-```text
--o LAN_IF -s LAN_CIDR -j MIHOMO_POSTROUTING
-```
-
-但停止时曾错误增加：
-
-```text
-! -s DEBIAN_IP
-```
-
-结果是父链跳转无法删除，`MIHOMO_POSTROUTING` 被清空后又因为仍被引用而无法 `-X`，最终残留空链。不要重新引入这个差异。
-
-新增父链跳转时，必须同时添加上述三处；删除或改变跳转时也必须同时修改三处。修改完成后逐字符比较生成脚本，而不是凭肉眼认为“逻辑等价”。
-
-`chain_remove` 不应吞掉仍被引用导致的删除错误。停止失败必须暴露出来，不能虚假报告成功。
-
-## Policy Routing Lifecycle
-
-`mihomo-routing.service` 拥有以下资源：
-
-- `fwmark 0xcc/0xff lookup 204 priority 100`
-
-- 兼容迁移时需要删除的旧规则 `fwmark 0xcc/0xcc lookup 204 priority 100`
-
-- 表 204 的 local default route
-
-启动时必须循环删除所有新旧同规格规则，再只添加一条正确规则，避免重复规则或旧掩码残留。停止时必须删除新旧规则并 flush 表 204。
-
-`mihomo-iptables.service` 依赖并排在 `mihomo-routing.service` 之后。不要让 TProxy 规则在策略路由不存在时长期保持 active。
-
-卸载必须同时清理：
-
-- 新旧策略规则的所有重复项
-
-- 表 204
-
-- `/etc/iproute2/rt_tables` 中脚本写入的 `204 mihomo`
-
-- 所有父链跳转
-
-- 所有 `MIHOMO_*` 链
-
-- 三个 systemd unit
-
-- sysctl 和 modules-load 文件
-
-卸载按设计保留 `/etc/mihomo/config.yaml` 和 `/usr/local/bin/mihomo`，除非用户明确要求删除。
-
-## mihomo Configuration Invariants
-
-安装必须在启动服务之前确认：
-
-- 如果存在顶层块式 `tun:`，其直属 `enable` 必须被规范化为唯一的 `false`；缺少该键时显式补上。没有 `tun:` 时保持 mihomo 默认禁用。
-
-- 重复顶层 `tun:` 或 `tun: { ... }` 内联映射必须拒绝自动修改，不能用宽泛的 `sed`/`grep` 误改 DNS、NTP、sniffer、health-check 等其他 `enable`。
-
-- 顶层 `tproxy-port` 与 `TPROXY_PORT` 一致。
-
-- DNS `enhanced-mode` 是 `redir-host`。
-
-- DNS `listen` 端口与 `DNS_PORT` 一致。
-
-- 顶层只有一个有效 `routing-mark: 255`。
-
-- `/usr/local/bin/mihomo -t -d /etc/mihomo` 返回成功。
-
-systemd 的 `ExecStartPre` 也必须再次执行配置测试，防止部署后手工改坏配置仍被启动。
-
-mihomo 服务只需要以下 capabilities：
-
-```text
-CAP_NET_ADMIN
-CAP_NET_RAW
-CAP_NET_BIND_SERVICE
-CAP_SYS_PTRACE
-CAP_DAC_READ_SEARCH
-```
-
-`PROCESS-NAME` 在 Linux 上通过 socket UID/inode 遍历 `/proc/<pid>/fd`，再读取
-`/proc/<pid>/exe`。`CAP_SYS_PTRACE` 用于跨 UID 的 procfs ptrace 访问检查，
-`CAP_DAC_READ_SEARCH` 用于只读绕过目录搜索和文件读取权限。不要加入与此路径无关的
-`CAP_SYS_TIME` 或权限范围更大的 `CAP_DAC_OVERRIDE`。
-
-进程识别只适用于旁路由本机产生的连接；旁路由无法读取 LAN 客户端机器上的进程信息，
-因此不能用 `PROCESS-NAME` 匹配其他设备上的应用。
-
-## Linux TCP Optimization Invariants
-
-本功能只移植 Zephyr `network_optim.rs` 在 Linux 上实际实现的项目：
-
-- `net.ipv4.tcp_fastopen`
-- `net.ipv4.tcp_ecn`
-- `net.core.rmem_max`
-- `net.core.wmem_max`
-- `net.ipv4.tcp_rmem`
-- `net.ipv4.tcp_wmem`
-- `net.ipv4.tcp_notsent_lowat`
-- `/sys/module/tcp_cubic/parameters/hystart_detect=2`
-
-上游没有设置 BBR、`default_qdisc` 或 `tcp_congestion_control`，因此不要以“补全网络优化”为理由擅自添加这些设置。CUBIC HyStart 调优不等于强制把拥塞控制算法改成 CUBIC。
-
-三档参数必须保持为：
-
-| 参数 | conservative | balanced | aggressive |
-| --- | ---: | ---: | ---: |
-| `tcp_fastopen` | 1 | 3 | 3 |
-| `tcp_ecn` | 2 | 1 | 1 |
-| `rmem_max` | 8388608 | 16777216 | 33554432 |
-| `wmem_max` | 16777216 | 33554432 | 67108864 |
-| `tcp_rmem` | `4096 131072 8388608` | `4096 262144 16777216` | `4096 524288 33554432` |
-| `tcp_wmem` | `4096 131072 16777216` | `4096 262144 33554432` | `4096 524288 67108864` |
-| `tcp_notsent_lowat` | 65536 | 131072 | 262144 |
-
-生命周期要求：
-
-1. `write_modules` 必须先加载 `tcp_cubic`，再由 `write_sysctl` 备份和应用参数。
-2. `/var/lib/mihomo-deploy/network-optim-backup.conf` 只在不存在时创建，重复安装不能覆盖首次安装前的原值。
-3. 备份只允许上述 7 个 sysctl 键和 `sys.module.tcp_cubic.hystart_detect`；恢复时必须使用严格白名单和纯数字/空白验证，防止备份文件变成命令注入入口。
-4. 所有持久 sysctl 写入脚本已有的 `/etc/sysctl.d/99-mihomo.conf`，不要另建 `99-zephyr-tcp-tuning.conf`，避免同一脚本拥有两个互相覆盖的 sysctl 文件。
-5. `mihomo-routing.service` 每次启动都重新写入 `hystart_detect=2`，因为 sysfs 模块参数不会由 sysctl 文件持久化。
-6. 卸载必须先删除 `99-mihomo.conf`，再从首次备份恢复运行中的 TCP 参数；全部恢复成功后才删除备份。任何恢复失败都要保留备份并报警。
-7. `status` 必须显示全部 7 个 sysctl 和当前 `hystart_detect`，不能只用配置文件存在来判断已应用。
-
-默认使用 `balanced`，与上游默认 `OptimLevel::Balanced` 一致。改变默认档位属于行为变化，必须由用户明确要求。CLI `--network-optim-level` 只能接受三个固定值。
-
-## Docker And Existing Firewall Rules
-
-- 如果 `DOCKER-USER` 存在，把 `MIHOMO_FORWARD` 跳转插入该链。
-
-- 如果 `DOCKER-USER` 不存在，才回退到 `FORWARD`。
-
-- `stop_rules` 必须同时尝试从两处删除，以处理 Docker 在部署后启动或停止的情况。
-
-- 不要删除、重排或重建 Docker 创建的链。
-
-- 不要用“为了简单”作为清空整张 filter/nat/mangle 表的理由。
-
-## Input And Environment Validation
-
-依赖安装只支持 Debian APT 和 Arch Linux pacman。APT 包名保持 `procps`、`conntrack`；Arch 包名必须使用 `procps-ng`、`conntrack-tools`。pacman 分支使用 `pacman -S --needed --noconfirm`，不要用会造成部分升级的 `pacman -Sy`，也不要擅自在部署脚本中强制整机升级。
-
-`mihomo-routing.service` 中的 `ip` 必须由安装时的 `command -v ip` 解析为绝对路径，不能写死 Debian 的 `/usr/sbin/ip` 或 Arch 的 `/usr/bin/ip`。`/etc/iproute2/rt_tables` 的创建和卸载清理必须共用 `RT_TABLES_FILE`。
-
-安装前必须拒绝：
-
-- 不存在或不可执行的 mihomo 二进制。
-
-- 不存在的配置文件。
-
-- `0`、大于 `65535` 或非数字端口。
-
-- 相同的 TProxy 和 DNS 端口。
-
-- 非法 IPv4 或 CIDR。
-
-- 不属于 `LAN_CIDR` 的 `DEBIAN_IP`。
-
-- 不存在的 `LAN_IF`。
-
-- 没有实际配置在 `LAN_IF` 上的 `DEBIAN_IP`。
-
-脚本启用了 `set -Eeuo pipefail`。编写 pipeline 时不要让下游命令提前退出并使上游收到 SIGPIPE；例如探测命令中避免 `awk '... { print; exit }'`，应消费完整输入或显式处理 pipeline 状态。
-
-## Change Procedure For AI Agents
-
-任何修改都按以下顺序进行：
-
-1. 完整阅读本文件和 `deploy-mihomo.sh`，确认用户要求属于支持拓扑。
-2. 说明准备修改的包路径和不变量；不要先动手再猜测。
-3. 只做与请求相关的最小修改，保留用户和 Docker 的现有规则。
-4. 如果修改生成脚本，检查外层 heredoc 的变量转义。外层安装变量应在生成时展开；生成脚本运行时变量必须写成 `\$VAR` 或 `\${VAR}`。
-5. 修改 YAML 时只操作明确的顶层块及其直属键；严禁全局替换所有 `enable`。
-6. 对每个父链跳转检查 start-delete、start-add、stop-delete 三处完全一致。
-7. 对 mark 修改检查 mihomo 配置、iptables、策略路由和旧规则迁移。
-8. 对 systemd 修改检查启动顺序、停止顺序、幂等 restart 和 uninstall。
-9. 修改 Linux TCP 参数时核对三档完整矩阵、首次备份、卸载恢复、HyStart 开机重设和状态输出；不要只改 sysctl 文件。
-10. 先验证外层脚本，再实际生成临时 `mihomo-iptables` 验证内层脚本。
-11. 明确区分“源脚本已修改”和“目标 Linux 已重新部署”；不要声称本地修改已经自动同步到目标机。
-12. 不要承诺绝对无 bug；如果没有在目标 Linux 加载真实规则，必须说明运行验证仍待完成。
+Also run a cross-language contract test that parses 30 continuous unique
+features from Go, verifies StandardScaler indices `2..13,23,24`, verifies
+RobustScaler indices `0,1`, generates metadata, and reparses `[order]` and
+definitions to confirm that every parameter count matches its index count.
+Without the complete mihomo Go module, report only `gofmt`, byte comparison,
+and Python contract-test results; do not claim `transform.go` compiled alone.
+
+## Development Workflow
+
+Before modifying deployment behavior:
+
+1. Read this file and all of `deploy-mihomo.sh`, then confirm the request fits
+   the supported topology.
+2. Identify every generated path and invariant affected by the change.
+3. Make the smallest scoped change and preserve user and Docker rules.
+4. For generated shell code, audit outer-heredoc expansion. Installation-time
+   variables expand in the outer script; generated-script runtime variables
+   must be written as `\$VAR` or `\${VAR}`.
+5. For YAML, edit only explicit top-level blocks and their direct children.
+6. For parent jumps, compare start pre-delete, start add, and stop delete.
+7. For mark changes, inspect config, iptables, policy routing, migration, and
+   uninstall together.
+8. For systemd changes, inspect ordering, stop behavior, restart idempotency,
+   and uninstall.
+9. For TCP changes, verify the complete matrix, first-install backup, restore,
+   boot-time HyStart write, and status output.
+10. Validate the outer deployment script and a generated temporary inner
+    `mihomo-iptables` script.
+
+Do not claim that a source change is deployed until the target Linux host has
+been reinstalled or explicitly synchronized. If real rules were not loaded on
+a target host, state that runtime validation remains pending.
 
 ## Required Static Verification
 
-至少执行：
+At minimum, syntax-check the deployment source:
 
 ```bash
 bash -n deploy-mihomo.sh
 ```
 
-还必须通过加载函数或等价测试，让脚本用示例参数生成临时规则脚本，再执行：
+For a deployment change, load the generator functions or use an equivalent
+harness to render a temporary helper, then run:
 
 ```bash
 bash -n /tmp/mihomo-iptables-test
 ```
 
-生成参数至少覆盖当前实际形态：
+Use at least this representative configuration:
 
 ```text
 LAN_IF=bond0
@@ -514,43 +548,37 @@ TPROXY_PORT=7894
 DNS_PORT=1053
 ```
 
-静态检查至少断言：
+Static assertions must cover:
 
-- TUN 规范化测试覆盖 `enable: true`、`enable: false`、缺少 `enable`、完全没有 `tun:`、重复 `enable`，并确认不会修改块外的其他 `enable`。
+- TUN normalization for `enable: true`, `enable: false`, missing `enable`, no
+  `tun:` block, and duplicate direct `enable`, while leaving unrelated
+  `enable` keys unchanged.
+- Rejection of duplicate top-level `tun:` blocks and inline `tun: { ... }`.
+- Exactly one start pre-delete and one stop delete for every parent jump.
+- Identical POSTROUTING specifications in all three lifecycle locations.
+- TProxy and DIVERT jumps on both `LAN_IF` and `lo`.
+- Bypass, destination exclusions, DNS exclusions, TCP mark, and UDP mark in
+  `MIHOMO_OUTPUT`.
+- The `MIHOMO_DNS` bypass before REDIRECT.
+- Policy routing with `0xcc/0xff`, not `0xcc/0xcc`.
+- Mihomo configuration validation in systemd `ExecStartPre`.
+- `rt_tables` cleanup in the outer uninstall path.
+- Every value in all three TCP profiles and rejection of an invalid profile.
+- First-install backup preservation and strict restore key/value validation.
+- `write_modules` before `write_sysctl`, including the `tcp_cubic` modules-load
+  entry.
+- Boot-time `hystart_detect=2` in `mihomo-routing.service`.
+- Removal of persistent sysctl settings before restore, and retention of the
+  backup after any restore failure.
 
-- 重复顶层 `tun:` 和内联 `tun: { ... }` 必须拒绝处理。
-
-- 所有父链跳转的 start-delete 与 stop-delete 各出现一次。
-
-- POSTROUTING 三处规格完全一致。
-
-- TProxy 与 DIVERT 在 LAN_IF 和 lo 上都存在。
-
-- `MIHOMO_OUTPUT` 同时有 bypass、目标排除、DNS 排除、TCP mark、UDP mark。
-
-- `MIHOMO_DNS` 的 bypass 位于 REDIRECT 之前。
-
-- 策略规则使用 `0xcc/0xff`，不是 `0xcc/0xcc`。
-
-- systemd 启动前测试 mihomo 配置。
-
-- 外层卸载逻辑删除 `rt_tables` 条目。
-
-- 三个 TCP 优化档位逐项匹配固定参数矩阵，非法档位被拒绝。
-
-- 首次备份不会被第二次安装覆盖，恢复只接受白名单键和数字值。
-
-- `write_modules` 在 `write_sysctl` 之前执行，`tcp_cubic` 被加入 modules-load。
-
-- `mihomo-routing.service` 每次启动设置 `hystart_detect=2`。
-
-- 卸载删除持久 sysctl 后恢复备份，恢复失败时不会删除备份文件。
-
-如果环境有 ShellCheck，运行它，但不要为了通过 ShellCheck 机械改变具有 netfilter 语义的参数顺序。
+Run ShellCheck when available, but do not mechanically reorder arguments whose
+netfilter semantics depend on the current full rule specification. For any
+edited files, also run `git diff --check` and the language-specific syntax or
+contract checks relevant to the change.
 
 ## Required Linux Runtime Verification
 
-重新部署后检查：
+After redeploying a behavior change on a supported Linux target, check:
 
 ```bash
 systemctl --no-pager --full status \
@@ -578,13 +606,8 @@ sysctl \
 cat /sys/module/tcp_cubic/parameters/hystart_detect
 ```
 
-正确策略规则应只有一条：
-
-```text
-fwmark 0xcc/0xff lookup 204
-```
-
-本机验证：
+Exactly one `fwmark 0xcc/0xff lookup 204` rule should remain. Verify local
+traffic with:
 
 ```bash
 curl -4 https://ipinfo.io/ip
@@ -592,7 +615,8 @@ dig example.com
 /usr/local/sbin/mihomo-iptables status
 ```
 
-生命周期验证会短暂中断代理，只在用户允许时执行：
+Lifecycle verification interrupts proxy traffic and requires explicit
+permission on an active target:
 
 ```bash
 /usr/local/sbin/mihomo-iptables stop
@@ -605,70 +629,47 @@ systemctl restart mihomo.service
 systemctl restart mihomo-iptables.service
 ```
 
-停止后两个检查都应无结果或报告链不存在。重新启动后每个父链跳转只能有一条，不能随 restart 增长。
+After stop, both POSTROUTING checks should return no rule or report that the
+chain does not exist. After repeated restarts, every parent jump must still
+appear exactly once.
 
 ## Troubleshooting Signals
 
-### POSTROUTING points to an empty MIHOMO_POSTROUTING
+- **POSTROUTING points to an empty `MIHOMO_POSTROUTING`:** compare the full
+  parent jump in start pre-delete, start insertion, and stop deletion. Do not
+  assume Docker caused it.
+- **Router-local traffic misses mihomo:** check the unique `routing-mark: 255`,
+  OUTPUT counters, `0xcc/0xff`, the single policy rule, table 204 local route,
+  and both loopback PREROUTING jumps. Test a public destination because private
+  destinations are intentionally direct.
+- **TUN creates routes or captures traffic:** inspect the installed config for
+  direct `tun.enable: false`, then identify the owner of any stale interface or
+  rule. Never flush the whole ruleset.
+- **TCP values cannot be restored:** verify that the root-owned `0600` backup
+  contains only allowlisted keys and numeric/whitespace values. Preserve it on
+  failure and restore the reported key rather than guessing a default.
+- **High mihomo CPU or a connection loop:** inspect `routing-mark: 255`, both
+  `0xff/0xff` bypass paths, any erroneous `/0xcc` policy mask, and duplicate
+  policy rules before adding speculative RETURN rules.
+- **LAN DNS works but router-local DNS fails:** verify the TCP/UDP nat OUTPUT
+  jumps and the matching mangle OUTPUT DNS returns. Local DNS uses REDIRECT,
+  not a TProxy mark.
 
-这通常意味着 stop 的删除规格与 start 的添加规格不同。先对比完整 `iptables -t nat -S POSTROUTING`，不要直接归因于 Docker。
+## Review Checklist
 
-### Local traffic does not enter mihomo
+Before completing a deployment-related change, be able to explain:
 
-依次检查：
+- the LAN TCP/UDP, router-local TCP/UDP, and router-local DNS paths;
+- why mihomo's own TCP/UDP/DNS does not loop;
+- why TUN is disabled and why normalization cannot edit unrelated `enable`
+  keys;
+- the active TCP profile, all seven sysctl values, backup location, and why a
+  failed uninstall preserves the backup;
+- where every parent jump is pre-deleted, added, and removed;
+- why repeated restarts do not duplicate jumps;
+- why stop/uninstall cannot leave referenced empty chains;
+- why Docker-owned rules are neither flushed nor replaced;
+- which conclusions are static and which were tested on a target Linux host.
 
-1. `/etc/mihomo/config.yaml` 是否为 `routing-mark: 255`。
-2. OUTPUT 是否命中 `MIHOMO_OUTPUT`。
-3. TCP/UDP 是否获得 `0xcc/0xff`。
-4. 是否只有一条正确的 policy rule。
-5. 表 204 是否有 local default route。
-6. lo 上是否有 MIHOMO_DIVERT 和 MIHOMO_TPROXY。
-7. 私网目标按设计不会代理，不要用私网地址测试公网透明代理。
-
-### TUN unexpectedly creates routes or captures traffic
-
-检查安装后的 `/etc/mihomo/config.yaml`，顶层 `tun:` 下必须是 `enable: false`。不要只修改源 `config.yaml` 后假定已部署副本同步；重新安装或明确同步生成物。TUN 表、规则或接口仍存在时，先确认是否来自旧 mihomo 进程或其他服务，再清理对应所有者的资源，不要清空整个系统规则集。
-
-### Linux TCP optimization cannot be reverted
-
-检查 `/var/lib/mihomo-deploy/network-optim-backup.conf` 是否存在、权限是否为 root `0600`、键是否属于白名单且值只包含数字和空白。恢复失败时不要删除或覆盖该文件，也不要用猜测的“默认值”替代原值。确认问题后针对失败键手工恢复，再重新执行卸载清理。
-
-### mihomo CPU high or connections loop
-
-优先检查 bypass，而不是增加 RETURN 猜测性规则：
-
-- mihomo 配置是否带 `routing-mark: 255`。
-
-- mangle OUTPUT 和 nat DNS 是否精确放行 `0xff/0xff`。
-
-- policy rule 是否错误使用了 `/0xcc`。
-
-- 是否存在旧的重复 policy rule。
-
-### DNS works for LAN but not the router itself
-
-检查 nat OUTPUT 的 TCP/UDP 53 跳转，以及 MIHOMO_OUTPUT 是否在 mangle 阶段对 53 端口 RETURN。不要把本机 DNS 直接打 TProxy mark。
-
-## Final Review Questions
-
-交付任何相关修改前，AI 必须能够明确回答：
-
-- LAN TCP、LAN UDP、本机 TCP、本机 UDP、本机 DNS 各走哪条路径？
-
-- mihomo 自身的 TCP/UDP/DNS 为什么不会回环？
-
-- 为什么 TUN 必须关闭，脚本如何保证只修改 `tun.enable` 而不碰其他 `enable`？
-
-- 当前 TCP 优化使用哪一档、7 个 sysctl 分别是多少、原值保存在哪里、卸载失败时备份为什么仍会保留？
-
-- 每条新父链跳转在哪里添加、在哪里预清理、在哪里停止删除？
-
-- restart 两次后为什么不会重复？
-
-- stop/uninstall 后为什么不会残留空链？
-
-- Docker 规则为什么不会被清空或覆盖？
-
-- 哪些结论只经过静态验证，哪些已经在目标 Linux 实测？
-
-如果无法回答，不要继续修改防火墙或策略路由代码。
+Do not merge firewall or policy-routing changes when these questions remain
+unanswered.
